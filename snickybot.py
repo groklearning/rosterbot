@@ -146,7 +146,7 @@ async def sendmsg(text, threadid=None, attach=None):
     kwargs['thread_ts'] = threadid
   if attach:
     kwargs['attachments'] = attach
-  response = await sc.chat_postMessage(**kwargs)
+  response = await sc.chat_postMessage(as_user=True, **kwargs)
   assert response['ok']
   if threadid:
     logger.info('Replied to thread {}: {}'.format(threadid, s_text(text)))
