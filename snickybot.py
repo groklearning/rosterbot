@@ -30,19 +30,21 @@ args = parser.parse_args()
 SLACK_TOKEN = args.token
 CALENDAR_URL = os.environ['CALENDAR_URL']
 OHNO_USERS = os.environ['OHNO_USERS'].split(',')
+OHNO_USERS_TEXT = ', '.join(['<@{}>'.format(user) for user in OHNO_USERS])
 CHANNEL = os.environ['CHANNEL']
 REDIS_ADDRESS = os.environ['REDIS_ADDRESS']
 REDIS_DB = int(os.environ['REDIS_DB'])
+START_DATETIME = datetime.fromisoformat(os.environ['START_DATETIME'])
 
 RE_SLACKID = re.compile('<@(\w+)>')
 AMENDED_REALNAMETOSLACK_KEY = 'snickybot:amended_realnametoslack'
 SLEEP_MINUTES = 1
 CHALLENGE_TIME_OFFSET = 10  # fixed hour offset
-UTCHOURS_ACTIVE_START = (9 - CHALLENGE_TIME_OFFSET) % 24
+UTCHOURS_ACTIVE_START = (8 - CHALLENGE_TIME_OFFSET) % 24
 UTCHOURS_ACTIVE_END = (21 - CHALLENGE_TIME_OFFSET) % 24
 
 # nb. test value on left, real value on right
-MINUTES_NOUSERS = args.test and 40 or 20  # max is 60, won't be checked before current hour
+MINUTES_NOUSERS = args.test and 55 or 20  # max is 60, won't be checked before current hour
 MINUTES_NOTIFY = args.test and 120 or 10
 MINUTES_DANGER = args.test and 5 or 1
 
@@ -120,8 +122,13 @@ def s_text(text):
 def extract_name_from_cal(next_tutor_cal):
   #next_tutor_cal.summary is something like:  #NCSS Tutoring (Firstname Lastname)
   summary = next_tutor_cal.summary
-  summary = summary.replace(chr(65288), '(')  # ??? some people have a weird start bracket
-  name = summary.replace('NCSS Tutoring (','')[:-1]
+  # ??? some people have a weird parentheses
+  summary = summary.replace(chr(65288), '(')
+  summary = summary.replace(chr(65289), ')')
+  match = re.search(r'\((.*)\)', summary)
+  if not match:
+    return None
+  name = match[1]
   logger.info('Name from calendar: {} => {}'.format(summary, s_name(name)))
   return(name)
 
@@ -152,8 +159,11 @@ async def message_tutor(slackid, name, impending_tutor_time):
   time_format = pretty_time_delta(impending_tutor_time)
   if slackid:
     text = ":smile: <@{}>'s ({}) shift starts in {}. Please ack with an emoji reaction.".format(slackid, name, time_format)
-  else:
+  elif name:
     text = ":smile: {}'s shift starts in {}, but I don't know their Slack username. Please reply to this thread with an @mention of their username to let me know who they are!".format(name, time_format)
+  else:
+    ohno_text = ', '.join(['<@{}>'.format(user) for user in OHNO_USERS])
+    text = ":smile: someone's shift starts in {}, but I couldn't find their name in the calendar summary (in brackets, like (Ludwig Kumar)). I'm confused! Pinging {}".format(time_format, OHNO_USERS_TEXT)
   return await sendmsg(text)
 
 
@@ -259,11 +269,14 @@ async def rtm_message(data, **kwargs):
 
 
 checked_hour = None  # the hour checked up to
-ohno_users_text = ', '.join(['<@{}>'.format(user) for user in OHNO_USERS])
 
 async def process_calendar():
   global checked_hour
   now = datetime.now(timezone.utc)  # calendar data is in UTC
+
+  if now < START_DATETIME:
+    logger.warning('Doing nothing - %s < %s', now, START_DATETIME)
+    return
 
   # do we need to notify that we're missing tutors?
   notify_missing_tutors = False
@@ -300,7 +313,7 @@ async def process_calendar():
     name = extract_name_from_cal(next_tutor_cal)
     slackid = tutors_dict.get(name, None)
 
-    # send them a message (slackid might be None) and save it for later
+    # send them a message (slackid/name might be None) and save it for later
     m = await message_tutor(slackid, name, impending_tutor_time)
     msg_id_to_watch[m['ts']] = {'sourcename': name, 'calid': calid}
     already_announced[calid] = {
@@ -311,6 +324,7 @@ async def process_calendar():
 
   if notify_missing_tutors:
     # timezones are hard.
+    rounded_datetime = now + timedelta(hours=1) - timedelta(minutes=now.minute, seconds=now.second, microseconds=now.microsecond)
     local_hour = (checked_hour + CHALLENGE_TIME_OFFSET) % 24
     attach = [
       {
@@ -324,7 +338,7 @@ async def process_calendar():
         ],
       },
     ]
-    await sendmsg("<!here> Warning! There're no tutors rostered on at {}:00! ({})".format(local_hour, ohno_users_text), attach=attach)
+    await sendmsg("<!here> Warning! There're no tutors rostered on at <!date^{}^{{time}}|{}:00 AEST>! ({})".format(int(rounded_datetime.timestamp()), local_hour, OHNO_USERS_TEXT), attach=attach)
 
   for calid in list(already_announced.keys()):  # we might modify this during iteration
     data = already_announced[calid]
@@ -351,7 +365,7 @@ async def process_calendar():
 
     who_text = format_real_name(prev_msg['sourcename'])
     ohno_text = ', '.join(['<@{}>'.format(user) for user in OHNO_USERS])
-    await sendmsg("Oh no! {} hasn't responded. Pinging {}".format(who_text, ohno_users_text), threadid=msgid)
+    await sendmsg("Oh no! {} hasn't responded. Pinging {}".format(who_text, OHNO_USERS_TEXT), threadid=msgid)
     del msg_id_to_watch[msgid]
 
 
