@@ -37,7 +37,7 @@ REDIS_DB = int(os.environ['REDIS_DB'])
 START_DATETIME = datetime.fromisoformat(os.environ['START_DATETIME'])
 
 RE_SLACKID = re.compile('<@(\w+)>')
-AMENDED_REALNAMETOSLACK_KEY = 'snickybot:amended_realnametoslack'
+AMENDED_REALNAMETOSLACK_KEY = 'rosterbot:amended_realnametoslack'
 SLEEP_MINUTES = 1
 CHALLENGE_TIME_OFFSET = 10  # fixed hour offset
 UTCHOURS_ACTIVE_START = (8 - CHALLENGE_TIME_OFFSET) % 24
@@ -48,14 +48,14 @@ MINUTES_NOUSERS = args.test and 55 or 20  # max is 60, won't be checked before c
 MINUTES_NOTIFY = args.test and 120 or 10
 MINUTES_DANGER = args.test and 5 or 1
 
-logger = logging.getLogger('snickybot')
+logger = logging.getLogger('rosterbot')
 
 if args.test:
   logging.basicConfig(level=logging.DEBUG)
-  logger.info("snickybot in TEST MODE")
+  logger.info("rosterbot in TEST MODE")
 else:
   logging.basicConfig(level=logging.INFO)
-  logger.info("snickybot in PROD MODE")
+  logger.info("rosterbot in PROD MODE")
 logger.info("nouser warning {}min, notify {}min, danger {}min".format(MINUTES_NOUSERS, MINUTES_NOTIFY, MINUTES_DANGER))
 
 # connect to things
