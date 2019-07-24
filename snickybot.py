@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 
-from slackclient import SlackClient
-from icalevents import icalevents
+import asyncio
 from datetime import datetime, timezone, timedelta
 import time
 import os
 import re
 import argparse
 import random  # for testing
+import logging
+import signal
+
+from cachetools.func import ttl_cache
+from icalevents import icalevents
+import redis
+import slack
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--test', '-t', action='store_true',
@@ -21,61 +28,39 @@ parser.add_argument('--silent', '-s', action='store_true',
 args = parser.parse_args()
 
 SLACK_TOKEN = args.token
-CALENDAR_URL = 'https://calendar.google.com/calendar/ical/ncss.edu.au_7hiaq9tlca1lsgfksjss4ejc4s%40group.calendar.google.com/private-23775cab8b8397efb35dd7f2b6e67d84/basic.ics'
-RE_SLACKID = re.compile('<@(\w+)>')
-LOOKUP_FILE = "username_log"
-REACTION_FILE = "reaction_log"
-OHNO_USERS = ['UBV5SETED', 'UBZ7T5C30']  # nicky and josie
-SLEEP_MINUTES = 1
+CALENDAR_URL = os.environ['CALENDAR_URL']
+OHNO_USERS = os.environ['OHNO_USERS'].split(',')
+OHNO_USERS_TEXT = ', '.join(['<@{}>'.format(user) for user in OHNO_USERS])
+CHANNEL = os.environ['CHANNEL']
+REDIS_ADDRESS = os.environ['REDIS_ADDRESS']
+REDIS_DB = int(os.environ['REDIS_DB'])
+START_DATETIME = datetime.fromisoformat(os.environ['START_DATETIME'])
 
+RE_SLACKID = re.compile('<@(\w+)>')
+AMENDED_REALNAMETOSLACK_KEY = 'rosterbot:amended_realnametoslack'
+SLEEP_MINUTES = 1
 CHALLENGE_TIME_OFFSET = 10  # fixed hour offset
-UTCHOURS_ACTIVE_START = (9 - CHALLENGE_TIME_OFFSET) % 24
+UTCHOURS_ACTIVE_START = (8 - CHALLENGE_TIME_OFFSET) % 24
 UTCHOURS_ACTIVE_END = (21 - CHALLENGE_TIME_OFFSET) % 24
 
 # nb. test value on left, real value on right
-MINUTES_NOUSERS = args.test and 40 or 20  # max is 60, won't be checked before current hour
+MINUTES_NOUSERS = args.test and 55 or 20  # max is 60, won't be checked before current hour
 MINUTES_NOTIFY = args.test and 120 or 10
 MINUTES_DANGER = args.test and 5 or 1
-CHANNEL = args.test and "CBXDYDGFP" or "CBVLC2MU3"
+
+logger = logging.getLogger('rosterbot')
 
 if args.test:
-  print("snickybot in TEST MODE")
+  logging.basicConfig(level=logging.DEBUG)
+  logger.info("rosterbot in TEST MODE")
 else:
-  print("snickybot in PROD MODE")
-print("nouser warning {}min, notify {}min, danger {}min".format(MINUTES_NOUSERS, MINUTES_NOTIFY, MINUTES_DANGER))
-print()
+  logging.basicConfig(level=logging.INFO)
+  logger.info("rosterbot in PROD MODE")
+logger.info("nouser warning {}min, notify {}min, danger {}min".format(MINUTES_NOUSERS, MINUTES_NOTIFY, MINUTES_DANGER))
 
-tutors_dict = {}  # real name to slackid
-
-# read whole file and fill it in
-try:
-  with open(LOOKUP_FILE) as f:
-    for line in f:
-      line = line.strip()
-      parts = line.split(',', 1)
-      if len(parts) != 2:
-        if line:
-          print("bad line: {}".format(line))
-        continue
-      foundid, sourcename = parts
-      tutors_dict[sourcename] = foundid
-except IOError:
-  pass # probably doesn't exist
-
-for sourcename in tutors_dict:
-  print("added user from db: {} => {}".format(sourcename, tutors_dict[sourcename]))
-
-# now open it again to append more logs
-username_file = open(LOOKUP_FILE, 'a')
-reaction_file = open(REACTION_FILE, 'a')
-
-# connect to Slack
-sc = SlackClient(SLACK_TOKEN)
-
-# connect to RTM API which feeds us stuff that happens
-if not sc.rtm_connect(with_team_state=False, auto_reconnect=True):
-  raise Exception("couldn't connect to RTM api")
-sc.rtm_send_message("welcome-test", "test")
+# connect to things
+sc = slack.WebClient(SLACK_TOKEN, run_async=True)
+r = redis.Redis(host=REDIS_ADDRESS, db=REDIS_DB)
 
 
 def is_checked_hour(hour):
@@ -84,13 +69,6 @@ def is_checked_hour(hour):
     return hour >= UTCHOURS_ACTIVE_START or hour < UTCHOURS_ACTIVE_END
   # normal contiguous range
   return hour >= UTCHOURS_ACTIVE_START and hour < UTCHOURS_ACTIVE_END
-
-
-def format_real_name(real_name):
-  if real_name in tutors_dict:
-    slackid = tutors_dict[real_name]
-    return '<@{}>'.format(slackid)
-  return '{}'.format(real_name)
 
 
 def pretty_time_delta(td):
@@ -109,9 +87,14 @@ def pretty_time_delta(td):
     return '%ds' % (seconds)
 
 
+@ttl_cache(ttl=60*5)
+def get_events():
+  return icalevents.events(url=CALENDAR_URL)
+
+
 def get_pending_tutor_cals(now):
   out = []
-  evs = icalevents.events(url=CALENDAR_URL)
+  evs = get_events()
   #'all_day', 'copy_to', 'description', 'end', 'start', 'summary', 'time_left', 'uid'
   evs.sort(key=lambda ev: now - ev.start, reverse=True)
 
@@ -128,32 +111,31 @@ def event_is_same(ev1, ev2):
   return ev1.uid == ev2.uid
 
 
-def get_members(members, tutors_dict):
-  # Woo Thought this was paginated but:
-  # At this time, providing no limit value will result in Slack attempting to deliver you the entire result set. If the collection is too large you may experience HTTP 500 errors. Resolve this scenario by using pagination.
-  if 'members' not in members:
-    print('got no members, maybe rate-limited: {}'.format(members))
-    return
-  for member in members['members']:
-    slackid = member['id']
-    real_name = member['real_name']
-    if real_name not in tutors_dict:
-      print('got member: {} => {}'.format(real_name, slackid))
-      tutors_dict[real_name] = slackid
+def s_name(name):
+  return name if args.test or ' ' not in name else name.split()[0]
+
+
+def s_text(text):
+  return text if args.test else '<redacted>'
 
 
 def extract_name_from_cal(next_tutor_cal):
   #next_tutor_cal.summary is something like:  #NCSS Tutoring (Firstname Lastname)
   summary = next_tutor_cal.summary
-  summary = summary.replace(chr(65288), '(')  # ??? some people have a weird start bracket
-  name = summary.replace('NCSS Tutoring (','')[:-1]
-  print('Name from calendar: {} => {}'.format(summary, name))
+  # ??? some people have a weird parentheses
+  summary = summary.replace(chr(65288), '(')
+  summary = summary.replace(chr(65289), ')')
+  match = re.search(r'\((.*)\)', summary)
+  if not match:
+    return None
+  name = match[1]
+  logger.info('Name from calendar: {} => {}'.format(summary, s_name(name)))
   return(name)
 
 
-def sendmsg(text, threadid=None, attach=None):
+async def sendmsg(text, threadid=None, attach=None):
   if args.silent:
-    print('Silent mode, not sending message (threadid={}): {}'.format(threadid, text))
+    logger.info('Silent mode, not sending message (threadid={}): {}'.format(threadid, s_text(text)))
     return {'ts': 'TODO-{}'.format(random.random())}
 
   kwargs = {
@@ -164,35 +146,81 @@ def sendmsg(text, threadid=None, attach=None):
     kwargs['thread_ts'] = threadid
   if attach:
     kwargs['attachments'] = attach
-  message = sc.api_call("chat.postMessage", **kwargs)
+  response = await sc.chat_postMessage(as_user=True, **kwargs)
+  assert response['ok']
   if threadid:
-    print('Replied to thead {}: {}'.format(threadid, text))
+    logger.info('Replied to thread {}: {}'.format(threadid, s_text(text)))
   else:
-    print('Messaged channel: {}'.format(text))
-  return message
+    logger.info('Messaged channel: {}'.format(s_text(text)))
+  return response['message']
 
 
-def message_tutor(slackid, name, impending_tutor_time):
+async def message_tutor(slackid, name, impending_tutor_time):
   time_format = pretty_time_delta(impending_tutor_time)
   if slackid:
     text = ":smile: <@{}>'s ({}) shift starts in {}. Please ack with an emoji reaction.".format(slackid, name, time_format)
-  else:
+  elif name:
     text = ":smile: {}'s shift starts in {}, but I don't know their Slack username. Please reply to this thread with an @mention of their username to let me know who they are!".format(name, time_format)
-  return sendmsg(text)
+  else:
+    ohno_text = ', '.join(['<@{}>'.format(user) for user in OHNO_USERS])
+    text = ":smile: someone's shift starts in {}, but I couldn't find their name in the calendar summary (in brackets, like (Ludwig Kumar)). I'm confused! Pinging {}".format(time_format, OHNO_USERS_TEXT)
+  return await sendmsg(text)
 
 
+tutors_dict = {}        # real name to slackid
 msg_id_to_watch = {}    # messages posted about calendar events (contains {sourcename, calid})
 already_announced = {}  # calendar events processed and posted about
 
 
-def handle_event(event):
-  if event['type'] == 'reaction_added':
-    return handle_event_reaction_added(event)
-  elif event['type'] == 'message':
-    return handle_event_message(event)
+def format_real_name(real_name):
+  if real_name in tutors_dict:
+    slackid = tutors_dict[real_name]
+    return '<@{}>'.format(slackid)
+  return '{}'.format(real_name)
 
 
-def handle_event_reaction_added(event):
+def add_tutor(member):
+  slackid = member['id']
+  real_name = member['real_name']
+  if real_name not in tutors_dict:
+    logger.info('got member: {} => {}'.format(s_name(real_name), slackid))
+    tutors_dict[real_name] = slackid
+
+
+async def load_tutors_dict():
+  # Woo Thought this was paginated but:
+  # At this time, providing no limit value will result in Slack attempting to deliver you the entire result set. If the collection is too large you may experience HTTP 500 errors. Resolve this scenario by using pagination.
+  response = await sc.users_list()
+  assert response['ok']
+
+  for member in response['members']:
+    add_tutor(member)
+
+  for (real_name, slackid) in r.hgetall(AMENDED_REALNAMETOSLACK_KEY).items():
+    real_name = real_name.decode('utf-8')
+    slackid = slackid.decode('utf-8')
+    tutors_dict[real_name] = slackid
+    logger.info('loading amended member: {} => {}'.format(s_name(real_name), slackid))
+
+
+@slack.RTMClient.run_on(event='member_joined_channel')
+async def rtm_member_joined_channel(data, **kwargs):
+  logger.debug('%s', data)
+  response = await sc.users_info(user=data['user'])
+  assert response['ok']
+  add_tutor(response['user'])
+
+
+@slack.RTMClient.run_on(event='user_change')
+async def rtm_user_change(data, **kwargs):
+  logger.debug('%s', data)
+  add_tutor(data['user'])
+
+
+@slack.RTMClient.run_on(event='reaction_added')
+async def rtm_reaction_added(data, **kwargs):
+  event = data
+  logger.debug('%s', event)
   msgid = event['item']['ts']
   userid = event['user']
 
@@ -203,20 +231,21 @@ def handle_event_reaction_added(event):
   slackid = tutors_dict.get(prev_msg['sourcename'], '')
   if slackid != userid:
     # if we don't know their slackid then they can't ack this :(
-    print("[{}] got reaction from non-target user: {}".format(msgid, event['reaction']))
+    logger.info("[{}] got reaction from non-target user: {}".format(msgid, event['reaction']))
     return  # not the user we care about
 
   del msg_id_to_watch[msgid]
   calid = prev_msg['calid']
   already_announced[calid]['acked'] = True
 
-  sendmsg("Thanks <@{}>! :+1::star-struck:".format(userid), threadid=msgid)
-  print("[{}] slack user {} acked tutoring with: {}".format(msgid, userid, event['reaction']))
-  reaction_file.write('{},{}\n'.format(userid, event['reaction']))
-  reaction_file.flush()
+  await sendmsg("Thanks <@{}>! :+1::star-struck:".format(userid), threadid=msgid)
+  logger.info("[{}] slack user {} acked tutoring with: {}".format(msgid, userid, event['reaction']))
 
 
-def handle_event_message(event):
+@slack.RTMClient.run_on(event='message')
+async def rtm_message(data, **kwargs):
+  event = data
+  logger.debug('%s', event)
   if 'thread_ts' not in event:
     return  # not a thread reply
 
@@ -228,27 +257,26 @@ def handle_event_message(event):
 
   out = RE_SLACKID.match(event['text'])
   if not out:
-    print("[{}] got reply to watched thread, ignoring: {}".format(threadid, event['text']))
+    logger.info("[{}] got reply to watched thread, ignoring: {}".format(threadid, s_text(event['text'])))
     return  # no userid
   foundid = out.group(1)
   tutors_dict[data['sourcename']] = foundid
-  print("[{}] connected '{}' to Slack: {}".format(threadid, data['sourcename'], foundid))
-  username_file.write("{},{}\n".format(foundid, data['sourcename']))
-  username_file.flush()
+  r.hset(AMENDED_REALNAMETOSLACK_KEY, data['sourcename'].encode('utf-8'), foundid.encode('utf-8'))
+  logger.info("[{}] connected '{}' to Slack: {}".format(threadid, s_name(data['sourcename']), foundid))
 
   # if reply contains syntax: <@UBWNYRKDX> map to user
-  sendmsg("Thanks! I've updated {}'s Slack username to be <@{}> -- please ack the original message with an emoji reaction. :+1:".format(data['sourcename'], foundid), threadid=threadid)
+  await sendmsg("Thanks! I've updated {}'s Slack username to be <@{}> -- please ack the original message with an emoji reaction. :+1:".format(data['sourcename'], foundid), threadid=threadid)
 
 
 checked_hour = None  # the hour checked up to
-ohno_users_text = ', '.join(['<@{}>'.format(user) for user in OHNO_USERS])
 
-while True:
-  members = sc.api_call("users.list")
-  get_members(members, tutors_dict)
-  print()
-
+async def process_calendar():
+  global checked_hour
   now = datetime.now(timezone.utc)  # calendar data is in UTC
+
+  if now < START_DATETIME:
+    logger.warning('Doing nothing - %s < %s', now, START_DATETIME)
+    return
 
   # do we need to notify that we're missing tutors?
   notify_missing_tutors = False
@@ -259,16 +287,13 @@ while True:
       notify_missing_tutors = True
     checked_hour = next_check_hour
 
-  #try:
   pending = get_pending_tutor_cals(now)
-  #except TimeoutError:
-  #  print('TimeoutError. Skipping for now.')
-  print("got {} pending cal events at {}".format(len(pending), now))
+  logger.info("got {} pending cal events at {}".format(len(pending), now))
   for next_tutor_cal in pending:
     if next_tutor_cal.start.hour == next_check_hour:
       # got an event starting in the next hour
       if notify_missing_tutors:
-        print("got event starting at {}:00, don't need to notify: {}".format(next_check_hour + CHALLENGE_TIME_OFFSET, next_tutor_cal))
+        logger.info("got event starting at {}:00, don't need to notify: {}".format(next_check_hour + CHALLENGE_TIME_OFFSET, next_tutor_cal))
       notify_missing_tutors = False
 
     # don't notify them, not close enoughb
@@ -288,8 +313,8 @@ while True:
     name = extract_name_from_cal(next_tutor_cal)
     slackid = tutors_dict.get(name, None)
 
-    # send them a message (slackid might be None) and save it for later
-    m = message_tutor(slackid, name, impending_tutor_time)
+    # send them a message (slackid/name might be None) and save it for later
+    m = await message_tutor(slackid, name, impending_tutor_time)
     msg_id_to_watch[m['ts']] = {'sourcename': name, 'calid': calid}
     already_announced[calid] = {
       'cal': next_tutor_cal,
@@ -299,6 +324,7 @@ while True:
 
   if notify_missing_tutors:
     # timezones are hard.
+    rounded_datetime = now + timedelta(hours=1) - timedelta(minutes=now.minute, seconds=now.second, microseconds=now.microsecond)
     local_hour = (checked_hour + CHALLENGE_TIME_OFFSET) % 24
     attach = [
       {
@@ -312,14 +338,14 @@ while True:
         ],
       },
     ]
-    sendmsg("<!here> Warning! There's no tutors rostered on at {}:00! ({})".format(local_hour, ohno_users_text), attach=attach)
+    await sendmsg("<!here> Warning! There're no tutors rostered on at <!date^{}^{{time}}|{}:00 AEST>! ({})".format(int(rounded_datetime.timestamp()), local_hour, OHNO_USERS_TEXT), attach=attach)
 
   for calid in list(already_announced.keys()):  # we might modify this during iteration
     data = already_announced[calid]
     cal = data['cal']
     msgid = data['msgid']
     if cal.end < now:
-      print('[{}] expiring calendar entry, past end time', msgid)
+      logger.info('[{}] expiring calendar entry, past end time', msgid)
       del already_announced[calid]
       del msg_id_to_watch[msgid]
       continue
@@ -333,22 +359,46 @@ while True:
 
     event_starts = (cal.start - now)
     minutes_away = event_starts.total_seconds() / 60  # negative if we've gone past no
-    print('[{}] {} shift in: {}'.format(msgid, prev_msg['sourcename'], pretty_time_delta(event_starts)))
+    logger.info('[{}] {} shift in: {}'.format(msgid, s_name(prev_msg['sourcename']), pretty_time_delta(event_starts)))
     if minutes_away > MINUTES_DANGER:
       continue
 
     who_text = format_real_name(prev_msg['sourcename'])
     ohno_text = ', '.join(['<@{}>'.format(user) for user in OHNO_USERS])
-    sendmsg("Oh no! {} hasn't responded. Pinging {}".format(who_text, ohno_users_text), threadid=msgid)
+    await sendmsg("Oh no! {} hasn't responded. Pinging {}".format(who_text, OHNO_USERS_TEXT), threadid=msgid)
     del msg_id_to_watch[msgid]
 
-  # sleep for 60s but check if we have events
-  for i in range(0, max(1, SLEEP_MINUTES * 60)):
-    events = sc.rtm_read()
-    for event in events:
-      handle_event(event)
-    time.sleep(1)
-  print(".")
+
+async def process_calendar_loop():
+  while True:
+    await process_calendar()
+    logger.info("Finished processing calendar entries; sleeping")
+    await asyncio.sleep(SLEEP_MINUTES * 60)
 
 
+async def main():
+  await load_tutors_dict()
+  rtm = slack.RTMClient(token=SLACK_TOKEN, run_async=True)
+  rtmtask = rtm.start()
+  caltask = asyncio.create_task(process_calendar_loop())
 
+  # Critical to add our own signal handler, because RTMClient tries to catch these
+  # but doesn't bother stopping process_calender_loop
+
+  def stop():
+    rtm.stop()
+    caltask.cancel()
+
+  for s in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+    asyncio.get_event_loop().add_signal_handler(s, stop)
+
+  await asyncio.gather(caltask, rtmtask)
+
+
+if __name__ == "__main__":
+  try:
+    asyncio.run(main())
+  except asyncio.CancelledError:
+    logger.info("Shutting down cleanly due to cancellation (we hope)")
+  except Exception:
+    logger.exception("Unexpected error")
