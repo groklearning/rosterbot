@@ -181,7 +181,7 @@ def format_real_name(real_name):
 
 def add_tutor(member):
   slackid = member['id']
-  real_name = member['real_name']
+  real_name = member.get('real_name', member['name'])
   if real_name not in tutors_dict:
     logger.info('got member: {} => {}'.format(s_name(real_name), slackid))
     tutors_dict[real_name] = slackid
