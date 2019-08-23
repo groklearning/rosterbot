@@ -112,7 +112,7 @@ def event_is_same(ev1, ev2):
 
 
 def s_name(name):
-  return name if args.test or ' ' not in name else name.split()[0]
+  return name if not name or args.test or ' ' not in name else name.split()[0]
 
 
 def s_text(text):
@@ -129,7 +129,7 @@ def extract_name_from_cal(next_tutor_cal):
   if not match:
     return None
   name = match[1]
-  logger.info('Name from calendar: {} => {}'.format(summary, s_name(name)))
+  logger.info('Name from calendar: {} => {}'.format(s_text(summary), s_name(name)))
   return(name)
 
 
@@ -293,7 +293,7 @@ async def process_calendar():
     if next_tutor_cal.start.hour == next_check_hour:
       # got an event starting in the next hour
       if notify_missing_tutors:
-        logger.info("got event starting at {}:00, don't need to notify: {}".format(next_check_hour + CHALLENGE_TIME_OFFSET, next_tutor_cal))
+        logger.info("got event starting at {}:00, don't need to notify: {}".format(next_check_hour + CHALLENGE_TIME_OFFSET, s_text(str(next_tutor_cal))))
       notify_missing_tutors = False
 
     # don't notify them, not close enoughb
@@ -347,7 +347,8 @@ async def process_calendar():
     if cal.end < now:
       logger.info('[{}] expiring calendar entry, past end time', msgid)
       del already_announced[calid]
-      del msg_id_to_watch[msgid]
+      if msgid in msg_id_to_watch:
+          del msgid
       continue
 
     if data['acked']:
